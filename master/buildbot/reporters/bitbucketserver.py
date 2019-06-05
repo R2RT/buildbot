@@ -127,20 +127,42 @@ class BitbucketServerPRCommentPush(notifier.NotifierBase):
     name = "BitbucketServerPRCommentPush"
 
     @defer.inlineCallbacks
-    def reconfigService(self, base_url, user, password, messageFormatter=None,
-                        verbose=False, debug=None, verify=None, **kwargs):
+    def reconfigService(self,
+                        base_url,
+                        user,
+                        password,
+                        messageFormatter=None,
+                        verbose=False,
+                        debug=None,
+                        verify=None,
+                        **kwargs):
         user, password = yield self.renderSecrets(user, password)
-        yield super().reconfigService(
-            messageFormatter=messageFormatter, watchedWorkers=None,
-            messageFormatterMissingWorker=None, subject='', addLogs=False,
-            addPatch=False, **kwargs)
+        yield super().reconfigService(messageFormatter=messageFormatter,
+                                      watchedWorkers=None,
+                                      messageFormatterMissingWorker=None,
+                                      subject='',
+                                      addLogs=False,
+                                      addPatch=False,
+                                      **kwargs)
         self.verbose = verbose
+        self._base_url = base_url
         self._http = yield httpclientservice.HTTPClientService.getService(
-            self.master, base_url, auth=(user, password),
-            debug=debug, verify=verify)
+            self.master,
+            base_url,
+            auth=(user, password),
+            debug=debug,
+            verify=verify)
+        self._managedBuildrequests = defaultdict(lambda: {'claimed': False, 'pr_url': None})
 
-    def checkConfig(self, base_url, user, password, messageFormatter=None,
-                    verbose=False, debug=None, verify=None, **kwargs):
+    def checkConfig(self,
+                    base_url,
+                    user,
+                    password,
+                    messageFormatter=None,
+                    verbose=False,
+                    debug=None,
+                    verify=None,
+                    **kwargs):
 
         super().checkConfig(messageFormatter=messageFormatter,
                             watchedWorkers=None,
@@ -149,6 +171,54 @@ class BitbucketServerPRCommentPush(notifier.NotifierBase):
                             addLogs=False,
                             addPatch=False,
                             **kwargs)
+
+    @defer.inlineCallbacks
+    def startService(self):
+        yield super().startService()
+        startConsuming = self.master.mq.startConsuming
+        self._buildrequestClaimed = yield startConsuming(
+            self.buildrequestClaimed,
+            ('buildrequests', None, 'claimed'))
+        self._buildsPropertiesUpdate = yield startConsuming(
+            self.buildsPropertiesUpdate,
+            ('builds', None, 'properties', 'update'))
+
+    @defer.inlineCallbacks
+    def stopService(self):
+        yield super().stopService()
+        if self._buildrequestClaimed is not None:
+            yield self._buildrequestClaimed.stopConsuming()
+            self._buildrequestClaimed = None
+        if self._buildsPropertiesUpdate is not None:
+            yield self._buildsPropertiesUpdate.stopConsuming()
+            self._buildsPropertiesUpdate = None
+
+    def buildrequestClaimed(self, key, data):
+        brid = data['buildrequestid']
+        self._managedBuildrequests[brid]['claimed'] = True
+
+    @defer.inlineCallbacks
+    def checkBuildrequest(self, brid):
+        if self._managedBuildrequests[brid]['claimed'] is True and self._managedBuildrequests['pr_url'] is not None:
+            try:
+                pr_url = self._managedBuildrequests[brid]['pr_url']
+                res = yield self.sendComment(pr_url, "The Buildbot has started building this")
+                if res.code not in (HTTP_CREATED, ):
+                    content = yield res.content()
+                    log.msg("{code}: Unable to send a comment: "
+                            "{content}".format(code=res.code, content=content))
+                elif self.verbose:
+                    log.msg('Comment sent to {url}'.format(url=pr_url))
+            except Exception as e:
+                log.err(e, 'Failed to send a comment to "{}"'.format(pr_url))
+            del self._managedBuildrequests[brid]
+
+    @defer.inlineCallbacks
+    def buildsPropertiesUpdate(self, key, data):
+        if 'buildnumber' in data:
+            brid = data['buildnumber'][0]
+            self._managedBuildrequests[brid]['pr_url'] = data['pullrequesturl'][0]
+            yield self.checkBuildrequest(brid)
 
     def isMessageNeeded(self, build):
         if 'pullrequesturl' in build['properties']:
@@ -160,30 +230,35 @@ class BitbucketServerPRCommentPush(notifier.NotifierBase):
         pass
 
     def sendComment(self, pr_url, text):
-        path = urlparse(unicode2bytes(pr_url)).path
-        payload = {'text': text}
-        return self._http.post(COMMENT_API_URL.format(
-            path=bytes2unicode(path)), json=payload)
+        payload = {"content": {"raw": text}}
+        endpoint = '/api/2.0/repositories' + pr_url[len(self._base_url):] + "/comments"
+        endpoint = endpoint.replace('pull-requests', 'pullrequests')  # todo - use `links/comment` from bitbuckets incoming json
+        return self._http.post(endpoint, json=payload)
 
     @defer.inlineCallbacks
-    def sendMessage(self, body, subject=None, type=None, builderName=None,
-                    results=None, builds=None, users=None, patches=None,
-                    logs=None, worker=None):
+    def sendMessage(self,
+                    body,
+                    subject=None,
+                    type=None,
+                    builderName=None,
+                    results=None,
+                    builds=None,
+                    users=None,
+                    patches=None,
+                    logs=None,
+                    worker=None):
         pr_urls = set()
         for build in builds:
             props = Properties.fromDict(build['properties'])
             pr_urls.add(props.getProperty("pullrequesturl"))
         for pr_url in pr_urls:
             try:
-                res = yield self.sendComment(
-                    pr_url=pr_url,
-                    text=body
-                )
-                if res.code not in (HTTP_CREATED,):
+                res = yield self.sendComment(pr_url=pr_url, text=body)
+                if res.code not in (HTTP_CREATED, ):
                     content = yield res.content()
                     log.msg("{code}: Unable to send a comment: "
-                        "{content}".format(code=res.code, content=content))
+                            "{content}".format(code=res.code, content=content))
                 elif self.verbose:
-                    log.msg('Comment sent to {url}'.format(url=pr_url))
+                    log.msg(f'Comment sent to {pr_url}, response: {res.content()}')
             except Exception as e:
                 log.err(e, 'Failed to send a comment to "{}"'.format(pr_url))
